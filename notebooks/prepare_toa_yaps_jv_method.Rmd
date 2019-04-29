@@ -1,0 +1,246 @@
+---
+title: 'Prepare TOA matrix for YAPS'
+output: 
+  html_document:
+    highlight: tango
+    number_sections: false
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: false
+  html_notebook:
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: false
+    number_sections: false 
+    highlight: tango
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 13px;
+  }
+td {  /* Table  */
+  font-size: 11px;
+}
+h1.title {
+  font-size: 26px;
+}
+h1 { /* Header 1 */
+  font-size: 22px;
+}
+h2 { /* Header 2 */
+    font-size: 16px;
+}
+h3 { /* Header 3 */
+  font-size: 14px;
+}
+h4 { /* Header 3 */
+  font-size: 9px;
+}
+
+</style>
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(timeit = local({
+  now = NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res = as.numeric(difftime(Sys.time(), now, units = 'secs'))
+      now <<- NULL
+      # use options$label if you want the chunk label as well
+      #paste('Chunk execution time: ', round(res, 2), ' sec')
+      res0 <<- res
+    }
+  }})
+)
+```
+<br>
+The following methodology and function parameters are based directly on Jenna Vergeynst's [Python code](https://github.com/JennaVergeynst/prepare_toa_for_yaps).  
+<mark style="background-color: #F2F2F2">Highlighted blocks</mark> are quotes from Jenna's repository.
+
+Use this code to prepare [time-synchronized](https://elipickh.github.io/ReceiverArrays/notebooks/time_sync_jv_method.html) data from receiver arrays, which outputs a matrix, with one row per ping (with unrecorded pings set to NA) and one column per receiver.
+The matrix can then be fed directly into [YAPS](https://github.com/baktoft/yaps) to get estimated locations. 
+
+# Setup
+* The <mark style="background-color: #F2F2F2"><span style="color:red">pkg_run</span></mark> function will load required libraries (and versions), installing/updating them first as needed
+```{r}
+# Disable scientific notation
+options(scipen=999) 
+
+# Print microseconds when viewing the data
+sigFiguresSec = 20
+options(digits.secs=sigFiguresSec)
+
+# Import custom R functions
+ for (f in list.files('../code', pattern='*.R')) {
+     source(paste0('../code/', f))
+ }
+
+pkg_run(list(
+            'lubridate', 
+            c('data.table', '1.12.0'),
+            'dygraphs',
+            'htmltools'),
+       load_verbose = FALSE,
+       inst_verbose = TRUE)
+```
+
+# Load data
+* Detection data from all receivers should be in one file
+* Supply the timezone for the datetime column
+
+The following sample data for [recs_df](https://github.com/JennaVergeynst/prepare_toa_for_yaps/blob/master/receiver_data_example.pkl) and [temperature](https://github.com/JennaVergeynst/prepare_toa_for_yaps/blob/master/temperature_data_example.pkl) were converted from pickle into csv.
+
+```{r}
+recs_df_path = '../data/recs_df_jv.csv'
+temperature_path = '../data/temperature_jv.csv'
+
+data_tz = 'GMT'
+# same as data_tz = 'UTC'
+
+Sys.setenv(TZ = data_tz)
+```
+
+* Read the df's and configure the datetime column
+```{r}
+recs_df = fread(recs_df_path, sep = ',', header = TRUE)[, 
+          SyncTime := ymd_hms(SyncTime, tz = data_tz)]
+
+temp_df = fread(temperature_path, sep = ',', header = TRUE)[, 
+          Time := ymd_hms(Time, tz = data_tz)]
+```
+
+Total rows recs_df: ``r formatC(nrow(recs_df), , big.mark=",")``<br>
+Total rows temp_df: ``r formatC(nrow(temp_df), , big.mark=",")``
+
+```{r}
+head(recs_df)
+```
+
+```{r}
+head(temp_df)
+```
+
+* Specify the transmitter (i.e., fish) ID 
+* Specify the datetime and receiver ID column names in `recs_df`
+* Specify min and max burst for random burst interval transmitters  
+```{r}
+ID = 46903
+
+dt_col = 'SyncTime'
+rec_col = 'receiver_SN'
+
+min_burst = 1.1
+max_burst = 1.3
+```
+
+```{r}
+setnames(temp_df, c(dt_col, 'temp_c'))
+setkeyv(temp_df, dt_col)
+
+mean_burst = round((min_burst + max_burst) / 2, 1)
+
+# Subset recs_df to the given transmitter ID
+tag_data = recs_df[Id == ID]
+setkeyv(tag_data, dt_col)
+
+rec_list = as.character(unique(tag_data$receiver_SN))
+```
+
+# Prepare TOA
+* Join temperatue onto the detection data based on nearest matching time
+* Calculate sound speed using Macknezie's formula (with salinity and depth fixed to 0 and 1, respectively)
+```{r}
+tag_data = temp_df[tag_data, roll = 'nearest'][, 
+           soundspeed := soundspeed_seawater_mackenzie(temp = temp_c, salinity = 0, depth = 1)]
+```
+
+* Reshape detections data to one observation per row
+* Split observations if time between detections are > <mark style="background-color: #F2F2F2"><span style="color:red">pas_tol</span></mark> minutes
+* <mark style="background-color: #F2F2F2"><span style="color:red">max_time</span></mark>: <mark style="background-color: #F2F2F2">Maximum time (in seconds) that a sound signal would take between furthest receivers</mark>
+```{r message=FALSE}
+toa_data = prepare_tag_data(tag_data, dt_col, rec_col, rec_list, max_time = 0.2, pas_tol = 5)
+```
+
+# Clean TOA
+* Clean up the TOA matrix:
+  + <mark style="background-color: #F2F2F2">When observations follow eachother faster than the minimum known time delay, the observation with the least receivers is removed.</mark>
+  + <mark style="background-color: #F2F2F2">Afterwards, the remaining observations that are still too close, are dropped if they have only one receiver in the row.</mark>
+  + <mark style="background-color: #F2F2F2">Reasoning: these observations are too far apart to belong to the same row (i.e. further than max travel time between receivers), so are probably originating from a multipath.</mark>
+```{r}
+cleaned_toa_data = clean_toa_data(toa_data, 
+                                  min_delay = (0.9 * min_burst), 
+                                  rec_list)
+```
+
+* <mark style="background-color: #F2F2F2">Function to fill the gaps of missing pings in the dataframe, based on R code of Henrik Baktoft.</mark>
+  + <mark style="background-color: #F2F2F2">Based on the average ping interval, a "virtual ping"-timeseries is created with stable burst interval on every average ping.</mark>
+  + <mark style="background-color: #F2F2F2">Then the available pings are related to their closest virtual ping, and all virtual pings between get NaN-rows.</mark>
+  + <mark style="background-color: #F2F2F2">only consider a track if it is more than 2 minutes long (120 seconds). Too short tracks will bug YAPS.</mark>
+```{r}
+filled_toa = lapply(split(cleaned_toa_data, by ='groups_pas'), 
+                    function(x) fill_gaps(x, rec_list, dt_col, mean_burst, 
+                                          min_track_length = 120))
+
+filled_toa = filled_toa[!is.na(filled_toa)]
+```
+
+* Re-fill any new gaps which may have been created in the previous step
+```{r}
+final_toa = lapply(filled_toa,
+                   function(x) fill_gaps(x, rec_list, dt_col, mean_burst, 
+                                         min_track_length = 120))
+```
+
+# Plot TOA's
+* Plot the resulting outputs
+```{r}
+ylim = c(min(toa_data$t_diff, na.rm = TRUE) - 1, 
+         5*max_burst)
+hlines = c(min_burst, max_burst)
+height = 300
+width = 800
+
+p1 = dg_plot(toa_data, 
+             main = paste0('Burst intervals fish ', ID, ' without cleaning'), 
+             y_cols = 't_diff', dt_col = dt_col, line_w = 0, show_pts = TRUE, group = 'compare',
+        ylim = ylim, hlines = hlines, height = height, width = width, r_selector = FALSE)
+
+p2 = dg_plot(cleaned_toa_data, 
+             main = paste0('Burst intervals fish ', ID, ' after 1st clean-up of too-close rows'), 
+             y_cols = 't_diff', dt_col = dt_col, line_w = 0, show_pts = TRUE, group = 'compare',
+        ylim = ylim, hlines = hlines, height = height, width = width, r_selector = FALSE)
+
+p3 = dg_plot(dcast(rbindlist(filled_toa), get(dt_col) ~ groups_pas, value.var = 't_diff'), 
+             main = paste0('Burst intervals fish ', ID, ' after filling of gaps'),
+             group = 'compare', dt_col = 'get(dt_col)', line_w = 0, show_pts = TRUE,
+        ylim = ylim, hlines = hlines, height = height, width = width, r_selector = FALSE)
+
+p4 = dg_plot(dcast(rbindlist(final_toa), get(dt_col) ~ groups_pas, value.var = 't_diff'), 
+             main = paste0('Burst intervals fish ', ID, ' after 2nd round of gap filling'), 
+             group = 'compare', dt_col = 'get(dt_col)', line_w = 0, show_pts = TRUE,
+        ylim = ylim, hlines = hlines, height = height, width = width, r_selector = FALSE)
+
+browsable(htmltools::tagList(list(p1, p2, p3, p4)))
+```
+
+# Export final TOA
+* Transform the outputs  
+
+`toa_yaps` and `ss_data` can be fed into YAPS (along with recevier coordinates) to get estimated locations
+```{r}
+final_toa_df = setkeyv(rbindlist(final_toa), dt_col)
+
+ss_data = final_toa_df$soundspeed
+toa_yaps = t(as.matrix(final_toa_df[, rec_list, with=F]))
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```

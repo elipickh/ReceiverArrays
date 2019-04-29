@@ -1,0 +1,338 @@
+---
+title: 'Receiver array time synchronization using splines and sync-tags'
+output: 
+  html_document:
+    highlight: tango
+    number_sections: false
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: false
+  html_notebook:
+    theme: united
+    toc: yes
+    toc_float:
+      collapsed: false
+    number_sections: false 
+    highlight: tango
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 13px;
+  }
+td {  /* Table  */
+  font-size: 11px;
+}
+h1.title {
+  font-size: 26px;
+}
+h1 { /* Header 1 */
+  font-size: 22px;
+}
+h2 { /* Header 2 */
+    font-size: 16px;
+}
+h3 { /* Header 3 */
+  font-size: 14px;
+}
+h4 { /* Header 3 */
+  font-size: 9px;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(timeit = local({
+  now = NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res = as.numeric(difftime(Sys.time(), now, units = 'secs'))
+      now <<- NULL
+      # use options$label if you want the chunk label as well
+      #paste('Chunk execution time: ', round(res, 2), ' sec')
+      res0 <<- res
+    }
+  }})
+)
+```
+<br>
+The following methodology and function parameters are based directly on Jenna Vergeynst's [Python code](https://github.com/JennaVergeynst/time_synchronization).  
+<mark style="background-color: #F2F2F2">Highlighted blocks</mark> are quotes from Jenna's repository.
+
+Use this code to synchronize receivers based on detection times of synchronization transmitters ('sync-tags').  
+The synchronized times can then be [processed](...) into a TOA matrix and fed into [YAPS](https://github.com/baktoft/yaps) to get estimated locations. 
+
+Note that the following synchronization process assumes that the sync-tags are embedded within their resepctive receivers (i.e., are not spatially separated).
+
+# Synchronization overview
+
+* If possible, apply linear corrections to the receives (e.g., VEMCO's time drift Auto Correct option in VUE)  
+* <mark style="background-color: #F2F2F2">Choose one receiver as the "base receiver", preferably a receiver in the middle of the array, that hears all of the other receivers. The base receiver is the time keeper, the clock of the other receivers will be synchronised with the base clock.</mark>  
+* <mark style="background-color: #F2F2F2">Go through the synchronisation process for each receiver. In this process, you compare the detection time of 2 receivers in a receiver pair (base receiver versus receiver in process) detecting the same transmitter (synchronisation transmitter of one of the pair). The goal is to model the spline: a function that reflects the deviation of the receiver clock from the base clock over time.</mark>  
+* <mark style="background-color: #F2F2F2">Check the figures and play with the parameters of the functions to get a smooth spline that fits (but NOT overfits!) the DTDs as good as possible.</mark>
+* <mark style="background-color: #F2F2F2">If you have receivers without synchronisation transmitter, it is still possible to synchronise them:</mark>
+  + <mark style="background-color: #F2F2F2">Model the spline of the DTD of the base receiver synchronisation transmitter between both receivers</mark>
+  + <mark style="background-color: #F2F2F2">Convert the distance between both receivers in time-distance by use of soundspeed</mark>
+  + <mark style="background-color: #F2F2F2">For the resulting spline, substract the time-distance from the base transmitter spline.</mark>
+
+# Setup
+* The <mark style="background-color: #F2F2F2"><span style="color:red">pkg_run</span></mark> function will load required libraries (and versions), installing/updating them first as needed
+```{r}
+# Disable scientific notation
+options(scipen=999) 
+
+# Print microseconds when viewing the data
+sigFiguresSec = 20
+options(digits.secs=sigFiguresSec)
+
+# Import custom R functions
+ for (f in list.files('../code', pattern='*.R')) {
+     source(paste0('../code/', f))
+ }
+
+pkg_run(list(
+            'lubridate', 
+            c('data.table', '1.12.0'),
+            'dygraphs'),
+       load_verbose = FALSE,
+       inst_verbose = TRUE)
+```
+
+# Load data
+* Detection times from each receiver should be in their own file.
+* Supply the timezone for the datetime column
+
+The following sample data for [base_rec](https://github.com/JennaVergeynst/time_synchronization/blob/master/example_base_461059.pkl) and [other_rec](https://github.com/JennaVergeynst/time_synchronization/blob/master/example_rec_461211.pkl) were converted from pickle into csv.
+
+```{r}
+base_rec_path = '../data/example_base_461059_jv.csv'
+other_rec_path = '../data/example_rec_461211_jv.csv'
+
+data_tz = 'GMT'
+# same as data_tz = 'UTC'
+
+Sys.setenv(TZ = data_tz)
+```
+
+* Read the df's and configure the datetime column
+```{r}
+base_receiver = fread(base_rec_path, sep = ',', header = TRUE)[, 
+                Time := ymd_hms(Time, tz = data_tz)]
+
+other_receiver = fread(other_rec_path, sep = ',', header = TRUE)[, 
+                 Time := ymd_hms(Time, tz = data_tz)]
+```
+
+Total rows base_receiver: ``r formatC(nrow(base_receiver), , big.mark=",")``<br>
+Total rows other_receiver: ``r formatC(nrow(other_receiver), , big.mark=",")``
+
+```{r}
+head(other_receiver)
+```
+
+* Specify the sync ID's for the base rec and the other rec (<mark style="background-color: #F2F2F2"><span style="color:red">bsync_id</span></mark> and <mark style="background-color: #F2F2F2"><span style="color:red">osync_id</span></mark>, respectively)
+* Specify the datetime and transmitter ID column names in the df's
+```{r}
+bsync_id = '62059'
+osync_id = '62211'
+
+dt_col = 'Time'
+id_col = 'ID'
+```
+
+# DTD and spline of other rec sync-tag
+
+## Add DTD
+* Subset base_receiver and other_receiver df's to the detections of the other_rec sync-tag. 
+* Then, for each detection in the other_receiver sub df, find the nearest detection (within time = <mark style="background-color: #F2F2F2"><span style="color:red">t_sec</span></mark> seconds) in the base_receiver sub df
+* Calculate DTD: the absolute time difference between each detection pair
+```{r timeit = TRUE}
+orec_osync = add_dtd(b_rec_data = base_receiver,
+                     o_rec_data = other_receiver,
+                     sync_id = osync_id,
+                     dt_cols = 'Time',
+                     id_cols = 'ID',
+                     t_sec = 100)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+
+
+* Plot the DTD
+* Adjust <mark style="background-color: #F2F2F2"><span style="color:red">plot_subset</span></mark> in order to plot only a subset of the of data, which is useful for large datasets (e.g., <mark style="background-color: #F2F2F2"><span style="color:red">plot_subset</span></mark> = 3 plots every 3rd value). Disable this feature by setting to FALSE (or 1). 
+```{r message=FALSE}
+dg_plot(orec_osync, dt_col = dt_col, plot_subset = 3, 
+        main = 'DTD of other rec sync-tag')
+```
+
+## Smooth DTD
+* Smooth the DTD to avoid a subsequent jumpy spline
+* <mark style="background-color: #F2F2F2">Play with the parameters to get the DTD smooth enough (BUT it does not have to be entirely smooth => the spline can handle some noisiness).</mark>
+* <mark style="background-color: #F2F2F2">e.g. in the example, if you set window_size=1 with outlier_lim=0.005, you will see the effect of insufficient smoothing</mark>
+* <mark style="background-color: #F2F2F2">Zoom in on the figure to check smoothness! (especially at jumps!)</mark>
+* <mark style="background-color: #F2F2F2">NOTE: if you smooth less here, the parameter s for modelling the spline will probably have to be larger (in some case this is the best solution).</mark>
+
+```{r timeit = TRUE}
+smooth_dtd(orec_osync,
+           outlier_lim = 0.005, 
+           window_size = 5)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+```{r}
+dg_plot(orec_osync, dt_col = dt_col, plot_subset = 2, line_w = 0.7, 
+        main = 'Smooth DTD of other rec sync-tag')
+```
+
+```{r}
+# If the original, un-smoothed DTD appears smooth enough, uncomment and run the following:
+# orec_osync[, dtd_smooth := dtd]
+```
+
+## Spline DTD
+* Split the df at large DTD gaps (> <mark style="background-color: #F2F2F2"><span style="color:red">gap_lim</span></mark> sec)
+* For each split, model the DTD spline
+
+NOTE: The spline method (and the <mark style="background-color: #F2F2F2"><span style="color:red">k_par</span></mark> and <mark style="background-color: #F2F2F2"><span style="color:red">s_par</span></mark> paramters) used here (*smooth.spline*) is different from the one in Jenna's code (Scipy's *UnivariateSpline*), but results should be fairly similar 
+```{r timeit = TRUE}
+spline_groups = model_spline_part(orec_osync, target_data = other_receiver, dt_cols = dt_col, 
+                                  gap_lim = 0.1, k_par = 5, s_par = 5e-4)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>  
+* Plot the resulting DTD spline 
+* <mark style="background-color: #F2F2F2">Check if there is nice correspondance between spline and DTD
+* <mark style="background-color: #F2F2F2">Zoom in closely to see this well, especially on break points.</mark>
+* <mark style="background-color: #F2F2F2">If there is no nice correspondance, play with the parameters of model_spline_part or smooth_DTD.</mark>
+* <mark style="background-color: #F2F2F2">For instance:</mark>
+  + <mark style="background-color: #F2F2F2">if overshoot of the spline at the breaks: you probably need to make the DTD smoother => decrease outlier_lim and/or increase window_size</mark>
+  + <mark style="background-color: #F2F2F2">if discrepancy between spline and DTD line is too large => decrease window_size (can even be 1)</mark>
+  + <mark style="background-color: #F2F2F2">if some part is not modelled: probably because it was lost by smoothing => increase outlier_lim</mark>
+  + <mark style="background-color: #F2F2F2">if the spline is overpredicting (i.e. follows every tiniest variation in DTD_smooth) => increase s and/or decrease k</mark>
+
+```{r}
+dg_plot(merge(x = spline_groups, y = orec_osync, all = TRUE), 
+        dt_col = dt_col,
+        y_cols = c('spline', 'dtd_smooth'),
+        main = 'DTD spline of other rec sync-tag',
+        plot_subset = 10, 
+        line_w = 0.7)
+```
+
+* Add the spline to the original other_recevier df 
+```{r}
+other_receiver[spline_groups, on = dt_col, spline_osync := i.spline]
+```
+
+# DTD and spline of base rec sync-tag
+* Repeat the previous process for the detections of the base receiver sync-tag
+
+## Add DTD
+```{r timeit = TRUE}
+orec_bsync = add_dtd(b_rec_data = base_receiver,
+                     o_rec_data = other_receiver,
+                     sync_id = bsync_id,
+                     dt_cols = 'Time',
+                     id_cols = 'ID',
+                     t_sec = 100)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+```{r}
+dg_plot(orec_bsync, dt_col = dt_col, plot_subset = 3, line_w = 1, 
+        main = 'DTD of base rec sync-tag')
+```
+
+## Smooth DTD
+```{r timeit = TRUE}
+smooth_dtd(orec_bsync, 
+           outlier_lim = 0.001, 
+           window_size = 6)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+```{r}
+dg_plot(orec_bsync, dt_col = dt_col, plot_subset = 2, line_w = 1, 
+        main = 'Smooth DTD of base rec sync-tag')
+```
+
+```{r}
+# If the original, un-smoothed DTD appears smooth enough, uncomment and run the following:
+#orec_bsync[, dtd_smooth := dtd]
+```
+
+## Spline DTD
+```{r timeit = TRUE}
+spline_groups = model_spline_part(orec_bsync, target_data = other_receiver, dt_cols = dt_col, k_par = 5, s_par = 5e-4)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+```{r}
+dg_plot(merge(x = spline_groups, y = orec_bsync, all = TRUE), 
+        dt_col = dt_col, 
+        y_cols = c('spline', 'dtd_smooth'),
+        main = 'DTD spline of base rec sync-tag', 
+        plot_subset = 20, 
+        line_w = 0.7)
+```
+
+* Add the spline to the original other_recevier df
+```{r timeit = TRUE}
+setkeyv(other_receiver, dt_col)[spline_groups, on = dt_col, spline_bsync := i.spline]
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+
+# Combine splines
+* Calculate the average spline from the splines of the two sync-tags
+* Fill missing spline values by linear interpolation
+```{r timeit = TRUE}
+other_receiver[, spline := (spline_bsync + spline_osync) / 2] %>% 
+    dt_linear_interp(dt_col, 'spline')
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+```{r}
+dg_plot(other_receiver, dt_col = dt_col, 
+        y_cols = c('spline_bsync', 'spline_osync', 'spline'),
+        main = 'DTD Spline of the other rec vs base rec',
+        plot_subset = 20, 
+        line_w = 0.7)
+```
+
+```{r}
+other_receiver[, synced_time := (get(dt_col) - spline)]
+```
+
+# Check DTD after synchronisation
+* Re-run the the process of adding DTD's with the newly synchronized times
+* Synchronized detection times should center around zero
+```{r timeit = TRUE}
+orec_osync = add_dtd(b_rec_data = base_receiver,
+                     o_rec_data = other_receiver,
+                     sync_id = osync_id,
+                     dt_cols = c(dt_col, 'synced_time'),
+                     t_sec = 100)
+
+smooth_dtd(orec_osync, 
+           outlier_lim = 0.001, 
+           window_size = 6)
+
+orec_bsync = add_dtd(b_rec_data = base_receiver,
+                     o_rec_data = other_receiver,
+                     sync_id = bsync_id,
+                     dt_cols = c(dt_col, 'synced_time'),
+                     t_sec = 100)
+
+smooth_dtd(orec_bsync,
+           outlier_lim = 0.001, 
+           window_size = 6)
+```
+<h4>`r paste('Chunk execution time: ', round(res0, 2), ' sec')`</h4>
+
+```{r}
+dg_plot(merge(x = orec_osync, y = orec_bsync, all = TRUE), 
+        dt_col = 'synced_time', 
+        y_cols = c('dtd_smooth.x', 'dtd_smooth.y'),
+        plot_subset = 2, line_w = 0.7)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
