@@ -5,14 +5,15 @@ prepare_tag_data = function(tag_data, dt_col, rec_col, rec_cols, max_time, pas_t
   # Args:
   #   tag_data: Data table or data frame with detection data for from all receivers for one transmitter.
   #   dt_col: Character name for the datetime POSIXct column.
-  #   rec_col: Character name for the receiver columns.
+  #   rec_col: Character name for the receiver ID columns.
+  #   rec_cols: Character vector with names of receiver ID's
   #   max_time: Numeric value indicating the max time (in seconds) that a sound signal would take between 
   #      furthest receivers.
   #   pas_tol: Numeric value indicating the max time (in minutes) between observations before a new 
   #      passing is started and the track is split up.
   #
   # Returns:
-  #   Data table with an added columns: soundspeed,  
+  #   Data table with added columns 
   data = copy(setDT(tag_data))
   data[, time_diff := as.numeric(difftime(get(dt_col),
                                         shift(get(dt_col)), 
@@ -34,7 +35,16 @@ prepare_tag_data = function(tag_data, dt_col, rec_col, rec_cols, max_time, pas_t
 }
 
 clean_toa_data = function(toa_data, min_delay, rec_cols) {
-  
+  # Clean TOA data 
+  # Based on https://github.com/JennaVergeynst/prepare_toa_for_yaps/blob/master/Prepare_toa_data.py
+  #
+  # Args:
+  #   toa_data: Data table output from prepare_tag_data.
+  #   min_delay: numeric value indicating the min time delay (in sec) for the transmitter
+  #   rec_cols: Character vector with names of receiver ID's.
+  #
+  # Returns:
+  #   Data table with added columns   
   data = copy(toa_data)
   data[, receiver_amount := rowSums(!is.na(.SD))
      , .SDcols = rec_cols][
@@ -56,7 +66,18 @@ clean_toa_data = function(toa_data, min_delay, rec_cols) {
 }
 
 fill_gaps = function(data, rec_cols, dt_col, mean_burst, min_track_length) {
-  
+  # Fill the gaps of missing pings in the dataframe, based on R code of Henrik Baktoft 
+  # Based on https://github.com/JennaVergeynst/prepare_toa_for_yaps/blob/master/Prepare_toa_data.py
+  #
+  # Args:
+  #   data: Data table output from clean_toa_data.
+  #   rec_cols: Character vector with names of receiver ID's.
+  #   dt_col: Character name for the datetime POSIXct column.
+  #   mean_burst: Numeric value indicating the mean burst interval (in sec) of the fish transmitter
+  #   min_track_length: Numeric value indicating the min lenght (in sec) of a track
+  #
+  # Returns:
+  #   Data table with added columns   
   if (nrow(data) > min_track_length) {
     
     data = copy(data)
