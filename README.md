@@ -19,7 +19,7 @@ This repository contains R functions and R Notebooks used to process and analyze
 
 <br>
 <br>
-<sup>1</sup> Baktoft, Gjelland, Økland & Thygesen (2017): Positioning of aquatic animals based on time-of-arrival and random walk models using YAPS (Yet Another Positioning Solver). [DOI:10.1038/s41598-017-14278-z](https://www.nature.com/articles/s41598-017-14278-z.pdf)
+<sup>1</sup> Baktoft, Gjelland, Økland & Thygesen (2017): Positioning of aquatic animals based on time-of-arrival and random walk models using YAPS (Yet Another Positioning Solver). (https://www.nature.com/articles/s41598-017-14278-z.pdf)
 
 
 
